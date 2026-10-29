@@ -1,0 +1,21 @@
+{
+  "name": "rssb-instant-bot",
+  "version": "1.0.0",
+  "description": "Instant Multi-Category RSSB Telegram Radar Bot with Watermarking",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
+  },
+  "keywords": [
+    "rssb",
+    "telegram-bot",
+    "koyeb",
+    "epoch-scanner",
+    "watermark"
+  ],
+  "author": "",
+  "license": "ISC"
+}
