@@ -2,6 +2,7 @@
  * RSSB Instant Multi-Category Telegram Bot with PDF Watermarking
  * -------------------------------------------------------------
  * • 1-Second Multi-Category Prober across 8 RSSB storage folders
+ * • Dedicated separate download pipeline (No socket starvation or premature timeouts)
  * • Automatic PDF Watermarking & Clickable Banners via pdf-lib
  * • 50 MB Telegram upload safeguard (auto-switches to link if > 49MB)
  * • Inline Action Buttons (Direct Link + 1-Tap Share to Friends)
@@ -62,20 +63,26 @@ const CATEGORIES = ALL_CATEGORIES.filter(c => !EXCLUDE_CATEGORIES.includes(c.key
 
 const RSSB_BASE = 'https://rssb.rajasthan.gov.in';
 
-// High-speed keep-alive HTTPS Agent with legacy SSL support
-const sslAgent = new https.Agent({
+// Dedicated HTTPS Agent for 1-second HEAD scanning checks
+const scanAgent = new https.Agent({
     secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT || 0x4,
     rejectUnauthorized: false,
     keepAlive: true,
-    maxSockets: 200,
-    maxFreeSockets: 100,
-    timeout: 5000
+    maxSockets: 150,
+    maxFreeSockets: 80
+});
+
+// Dedicated HTTPS Agent for downloading full PDF files (never starved by HEAD checks)
+const downloadAgent = new https.Agent({
+    secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT || 0x4,
+    rejectUnauthorized: false,
+    keepAlive: true,
+    maxSockets: 20,
+    maxFreeSockets: 10
 });
 
 // Tracker & Statistics
-// 1. Sent hits Set: Permanently tracks sent hits to prevent duplicate alerts
 const sentHits = new Set();
-// 2. Rolling window for checked second IDs (auto-cleaned to prevent memory leaks)
 const recentChecked = new Map();
 
 let stats = {
@@ -120,12 +127,13 @@ function checkCategoryPdf(catKey, epochId) {
             port: 443,
             path: `/storage/${catKey}/${epochId}.pdf`,
             method: 'HEAD',
-            agent: sslAgent,
+            agent: scanAgent,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': `${RSSB_BASE}/`,
                 'Connection': 'keep-alive'
             },
-            timeout: 4000
+            timeout: 4500
         }, (res) => {
             const hit = res.statusCode === 200 || res.statusCode === 206;
             const size = parseInt(res.headers['content-length'] || '0', 10);
@@ -139,33 +147,71 @@ function checkCategoryPdf(catKey, epochId) {
     });
 }
 
-// ── Fast Download of Hit PDF ──────────────────────────────────────────────
-function downloadPdf(catKey, epochId) {
+// ── Fast & Resilient Download of Hit PDF (With Auto-Retry) ─────────────────
+function downloadPdfOnce(catKey, epochId, timeoutMs = 35000) {
     return new Promise((resolve, reject) => {
-        const req = https.request({
+        let isDone = false;
+        const timer = setTimeout(() => {
+            if (!isDone) {
+                isDone = true;
+                req.destroy(new Error(`Download timeout after ${timeoutMs / 1000}s`));
+            }
+        }, timeoutMs);
+
+        const req = https.get({
             hostname: 'rssb.rajasthan.gov.in',
             port: 443,
             path: `/storage/${catKey}/${epochId}.pdf`,
-            method: 'GET',
-            agent: sslAgent,
+            agent: downloadAgent,
             headers: {
-                'User-Agent': 'Mozilla/5.0',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': `${RSSB_BASE}/`,
+                'Accept': '*/*',
                 'Connection': 'keep-alive'
-            },
-            timeout: 30000
+            }
         }, (res) => {
-            if (res.statusCode !== 200) {
+            if (res.statusCode !== 200 && res.statusCode !== 206) {
+                clearTimeout(timer);
+                isDone = true;
                 res.resume();
                 return reject(new Error(`HTTP ${res.statusCode}`));
             }
             const chunks = [];
             res.on('data', c => chunks.push(c));
-            res.on('end', () => resolve(Buffer.concat(chunks)));
+            res.on('end', () => {
+                if (!isDone) {
+                    clearTimeout(timer);
+                    isDone = true;
+                    resolve(Buffer.concat(chunks));
+                }
+            });
+            res.on('error', (e) => {
+                if (!isDone) {
+                    clearTimeout(timer);
+                    isDone = true;
+                    reject(e);
+                }
+            });
         });
-        req.on('error', reject);
-        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-        req.end();
+
+        req.on('error', (e) => {
+            if (!isDone) {
+                clearTimeout(timer);
+                isDone = true;
+                reject(e);
+            }
+        });
     });
+}
+
+// Wrapper with 1 immediate retry if network drops
+async function downloadPdf(catKey, epochId) {
+    try {
+        return await downloadPdfOnce(catKey, epochId, 30000);
+    } catch (e1) {
+        console.warn(`[RETRY] First attempt for ${catKey}/${epochId} failed (${e1.message}), retrying...`);
+        return await downloadPdfOnce(catKey, epochId, 45000);
+    }
 }
 
 // ── Extract Original Document Title (/Title metadata) ─────────────────────
@@ -406,7 +452,30 @@ async function onHitDetected(cat, epochId, size) {
         const buf = await downloadPdf(cat.key, epochId);
         broadcastHit(cat, epochId, buf);
     } catch (e) {
-        console.error(`Download failed for ${cat.key}/${epochId}:`, e.message);
+        console.error(`Download failed for ${cat.key}/${epochId} (${e.message}), sending link alert fallback...`);
+        // If binary download fails, send alert with direct link so channel still gets instant update!
+        const targets = new Set(CHAT_IDS.filter(Boolean));
+        const pdfUrl = `${RSSB_BASE}/storage/${cat.key}/${epochId}.pdf`;
+        const caption = `${cat.icon} <b>RSSB Official Notification</b>\n\n`
+            + `📋 <b>Category:</b> ${cat.label}\n`
+            + `📅 <b>Published:</b> ${epochToIST(epochId)}\n\n`
+            + `${cat.hashtag}`;
+        for (const cid of targets) {
+            enqueueDispatch(async () => {
+                await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        chat_id: String(cid),
+                        text: caption,
+                        parse_mode: 'HTML',
+                        reply_markup: {
+                            inline_keyboard: [[{ text: '📥 Open Official Document', url: pdfUrl }]]
+                        }
+                    })
+                }).catch(() => {});
+            });
+        }
     }
     console.log(`======================================================\n`);
 }
@@ -581,15 +650,15 @@ async function handleCommand(msg) {
     }
 
     if (cmd === '/testsend' || cmd.startsWith('/testsend@')) {
-        await sendTelegramReply(chatId, `Testing sample PDF download & watermarking...`);
+        await sendTelegramReply(chatId, `⏳ Downloading sample PDF & applying branding... Please wait a few seconds.`);
         const sampleCat = CATEGORIES[0];
         const sampleId = '1793125170';
         try {
             const buf = await downloadPdf(sampleCat.key, sampleId);
             await sendPdfToChat(chatId, sampleCat, sampleId, buf);
-            await sendTelegramReply(chatId, `✅ Test PDF successfully dispatched!`);
+            await sendTelegramReply(chatId, `✅ Test notice & PDF successfully dispatched!`);
         } catch (e) {
-            await sendTelegramReply(chatId, `❌ Test failed: ${e.message}`);
+            await sendTelegramReply(chatId, `❌ Test download failed: ${e.message}`);
         }
         return;
     }
