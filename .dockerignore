@@ -1,0 +1,8 @@
+node_modules
+.git
+bin
+EMRS-main
+rssb-scanner
+*.bat
+*.ps1
+scratch
